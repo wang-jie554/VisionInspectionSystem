@@ -86,6 +86,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [ObservableProperty]
     private SKBitmap? _detectionResultImage;
 
+    // 主相机实时预览在 ROI 编辑器中的独立副本。
+    // 不与 CameraViewItem / 推理线程共享 SKBitmap 所有权，避免一方 Dispose 后另一方继续访问原生句柄。
+    private SKBitmap? _roiPreviewImage;
+
     // ===== 多相机画面 =====
 
     /// <summary>多相机画面集合（主相机在前，供主界面宫格布局）</summary>
@@ -324,34 +328,66 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             }
         }
 
-        // 在UI线程更新对应画面（主相机同步到 ROI 编辑画面，避免阻塞相机采集线程）
+        // 每个异步消费者持有自己的 SKBitmap，禁止 UI、ROI 编辑器、推理线程共享同一个可释放的原生对象。
+        // 否则下一帧替换画面时 Dispose 旧位图，会让仍在绘制/推理的一方访问已经释放的 Skia 原生内存。
+        var roiBitmap = isPrimary ? skBitmap.Copy() : null;
+        SKBitmap? inferenceBitmap = null;
+        if (isPrimary && IsRealTimeDetecting && _detectionService.IsInitialized && !_isProcessingFrame)
+        {
+            inferenceBitmap = skBitmap.Copy();
+        }
+
+        // 在 UI 线程更新对应画面（主相机同步到 ROI 编辑画面，避免阻塞相机采集线程）
         System.Windows.Application.Current.Dispatcher.BeginInvoke(new Action(() =>
         {
-            if (_isDisposed) return;
-
-            var item = CameraViews.FirstOrDefault(v => string.Equals(v.CameraId, e.CameraId, StringComparison.OrdinalIgnoreCase));
-            if (item != null)
-            {
-                item.CurrentImage?.Dispose();
-                item.CurrentImage = skBitmap;
-                item.IsConnected = true;
-            }
-            else
+            if (_isDisposed)
             {
                 skBitmap.Dispose();
+                roiBitmap?.Dispose();
                 return;
             }
 
-            if (isPrimary && RoiEditorViewModel != null)
+            var item = CameraViews.FirstOrDefault(v => string.Equals(v.CameraId, e.CameraId, StringComparison.OrdinalIgnoreCase));
+            if (item == null)
             {
-                RoiEditorViewModel.CurrentImage = skBitmap;
+                skBitmap.Dispose();
+                roiBitmap?.Dispose();
+                return;
             }
+
+            // 先切换引用，再释放旧图，避免 PropertyChanged / PaintSurface 观察到已释放对象。
+            var oldItemImage = item.CurrentImage;
+            item.CurrentImage = skBitmap;
+            item.IsConnected = true;
+
+            SKBitmap? oldRoiPreview = null;
+            if (isPrimary && RoiEditorViewModel != null && roiBitmap != null)
+            {
+                oldRoiPreview = _roiPreviewImage;
+                _roiPreviewImage = roiBitmap;
+                RoiEditorViewModel.CurrentImage = roiBitmap;
+            }
+            else
+            {
+                roiBitmap?.Dispose();
+            }
+
+            // 旧 CameraView 图像若仍被其他已知入口引用，则不在这里释放，由对应所有者负责。
+            if (oldItemImage != null &&
+                !ReferenceEquals(oldItemImage, CurrentImage) &&
+                !ReferenceEquals(oldItemImage, DetectionResultImage) &&
+                !ReferenceEquals(oldItemImage, RoiEditorViewModel?.CurrentImage))
+            {
+                oldItemImage.Dispose();
+            }
+
+            oldRoiPreview?.Dispose();
         }));
 
-        // 实时检测（仅主相机）触发推理
-        if (isPrimary && IsRealTimeDetecting && _detectionService.IsInitialized && !_isProcessingFrame)
+        // 实时检测使用独立副本；PerformRealTimeDetectionAsync 负责释放。
+        if (inferenceBitmap != null)
         {
-            _ = PerformRealTimeDetectionAsync(skBitmap);
+            _ = PerformRealTimeDetectionAsync(inferenceBitmap);
         }
     }
 
@@ -381,8 +417,19 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         // 移除已断开或已注销的槽位
         foreach (var removed in CameraViews.Where(v => !connected.Any(c => string.Equals(c.CameraId, v.CameraId, StringComparison.OrdinalIgnoreCase))).ToList())
         {
-            removed.CurrentImage?.Dispose();
             CameraViews.Remove(removed);
+            removed.CurrentImage?.Dispose();
+
+            if (removed.IsPrimary && _roiPreviewImage != null)
+            {
+                if (ReferenceEquals(RoiEditorViewModel?.CurrentImage, _roiPreviewImage))
+                {
+                    RoiEditorViewModel.CurrentImage = null;
+                }
+
+                _roiPreviewImage.Dispose();
+                _roiPreviewImage = null;
+            }
         }
 
         // 新增/更新已连接槽位（主相机在前）
@@ -615,6 +662,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     /// </summary>
     private async Task PerformRealTimeDetectionAsync(SKBitmap bitmap)
     {
+        using var ownedBitmap = bitmap;
+
         // 使用信号量防止并发处理（支持异步）
         if (!await _inferenceLock.WaitAsync(0))
             return;
